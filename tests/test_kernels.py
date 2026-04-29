@@ -20,26 +20,40 @@ import torch
 from hf_npu_binder.qwen3_5_moe import (
     causal_conv1d,
     chunk_gated_delta_rule,
+    experts,
     fused_recurrent_gated_delta_rule,
 )
 
 
-_OPERATORS = [
+# Operators with the (q,k,v,g,beta,...) GDN signature ship triton + flash.
+_GDN_OPERATORS = [
     chunk_gated_delta_rule,
     fused_recurrent_gated_delta_rule,
     causal_conv1d,
 ]
-_BACKENDS = ["triton", "flash"]
+_GDN_BACKENDS = ["triton", "flash"]
+
+# experts is the whole MoE forward (permute + gmm + swiglu + gmm + unpermute).
+# Reference only ships the ascendc-fused composite as a single "flash" backend
+# — there is no pure-triton MoE expert path because nobody has rewritten the
+# permute/unpermute kernels in pure triton.
+_EXPERTS_BACKENDS = ["flash"]
 
 
-def test_every_operator_exposes_every_backend() -> None:
-    """Each operator file ships exactly the same set of backend names."""
-    for module in _OPERATORS:
-        for backend in _BACKENDS:
+def test_every_gdn_operator_exposes_every_backend() -> None:
+    """Each GDN operator file ships exactly the same set of backend names."""
+    for module in _GDN_OPERATORS:
+        for backend in _GDN_BACKENDS:
             fn = getattr(module, backend, None)
             assert callable(fn), (
                 f"{module.__name__}.{backend} missing or not callable"
             )
+
+
+def test_experts_exposes_flash_backend() -> None:
+    for backend in _EXPERTS_BACKENDS:
+        fn = getattr(experts, backend, None)
+        assert callable(fn), f"experts.{backend} missing or not callable"
 
 
 def test_chunk_and_recurrent_share_signature() -> None:
@@ -49,7 +63,7 @@ def test_chunk_and_recurrent_share_signature() -> None:
     expected = ["query", "key", "value", "g", "beta",
                 "initial_state", "output_final_state", "use_qk_l2norm_in_kernel"]
     for module in (chunk_gated_delta_rule, fused_recurrent_gated_delta_rule):
-        for backend in _BACKENDS:
+        for backend in _GDN_BACKENDS:
             sig = inspect.signature(getattr(module, backend))
             params = list(sig.parameters)
             assert params == expected, (
@@ -60,7 +74,7 @@ def test_chunk_and_recurrent_share_signature() -> None:
 
 def test_causal_conv1d_signature() -> None:
     expected = ["hidden_states", "conv_state", "weight", "bias", "activation"]
-    for backend in _BACKENDS:
+    for backend in _GDN_BACKENDS:
         sig = inspect.signature(getattr(causal_conv1d, backend))
         params = list(sig.parameters)
         assert params == expected, (
@@ -68,9 +82,24 @@ def test_causal_conv1d_signature() -> None:
         )
 
 
+def test_experts_signature_matches_hf_dispatch() -> None:
+    """experts.flash must match HuggingFace ALL_EXPERTS_FUNCTIONS shape:
+    fn(self, hidden_states, top_k_index, top_k_weights). The first param
+    receives the experts ``nn.Module`` instance from the dispatch wrapper.
+    """
+    expected = ["self", "hidden_states", "top_k_index", "top_k_weights"]
+    for backend in _EXPERTS_BACKENDS:
+        sig = inspect.signature(getattr(experts, backend))
+        params = list(sig.parameters)
+        assert params == expected, (
+            f"experts.{backend} signature drift: {params} != {expected}"
+        )
+
+
 def test_stubs_raise_not_implemented() -> None:
     """Stubs must be loud, not silent."""
     z = torch.zeros(1)
+    fake_self = object()
     cases = [
         # (callable, args, kwargs)
         (chunk_gated_delta_rule.triton, (z, z, z),
@@ -83,6 +112,7 @@ def test_stubs_raise_not_implemented() -> None:
          dict(g=z, beta=z, initial_state=None, output_final_state=False)),
         (causal_conv1d.triton, (z, z, z), dict(bias=None, activation=None)),
         (causal_conv1d.flash,  (z, z, z), dict(bias=None, activation=None)),
+        (experts.flash, (fake_self, z, z, z), {}),
     ]
     for fn, args, kwargs in cases:
         try:
@@ -113,9 +143,11 @@ def test_package_does_not_import_alloy() -> None:
 
 
 _TESTS = [
-    test_every_operator_exposes_every_backend,
+    test_every_gdn_operator_exposes_every_backend,
+    test_experts_exposes_flash_backend,
     test_chunk_and_recurrent_share_signature,
     test_causal_conv1d_signature,
+    test_experts_signature_matches_hf_dispatch,
     test_stubs_raise_not_implemented,
     test_package_does_not_import_alloy,
 ]

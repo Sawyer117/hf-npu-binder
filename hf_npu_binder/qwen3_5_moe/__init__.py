@@ -10,10 +10,12 @@ from __future__ import annotations
 
 from . import causal_conv1d
 from . import chunk_gated_delta_rule
+from . import experts
 from . import fused_recurrent_gated_delta_rule
 
 __all__ = [
     "causal_conv1d",
     "chunk_gated_delta_rule",
+    "experts",
     "fused_recurrent_gated_delta_rule",
 ]
