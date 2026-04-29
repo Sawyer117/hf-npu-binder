@@ -23,6 +23,7 @@ from hf_npu_binder.qwen3_5_moe import (
     experts,
     fused_recurrent_gated_delta_rule,
 )
+from hf_npu_binder.shared import gmm
 
 
 # Operators with the (q,k,v,g,beta,...) GDN signature ship triton + flash.
@@ -96,6 +97,27 @@ def test_experts_signature_matches_hf_dispatch() -> None:
         )
 
 
+def test_shared_gmm_present_and_signature() -> None:
+    """shared.gmm.flash is the grouped matmul primitive that experts.flash
+    composes with permute / unpermute / swiglu. Signature must stay stable
+    so future MoE family files can rely on it.
+    """
+    assert callable(gmm.flash), "shared.gmm.flash missing"
+    expected = ["x", "weight", "group_list"]
+    sig = inspect.signature(gmm.flash)
+    params = list(sig.parameters)
+    assert params == expected, f"shared.gmm.flash signature drift: {params} != {expected}"
+
+
+def test_experts_imports_shared_gmm() -> None:
+    """experts.py stages shared.gmm as ``gmm_flash`` for the real impl.
+    Catches accidental removal of the import wiring.
+    """
+    assert getattr(experts, "gmm_flash", None) is gmm.flash, (
+        "experts.gmm_flash should re-export shared.gmm.flash"
+    )
+
+
 def test_stubs_raise_not_implemented() -> None:
     """Stubs must be loud, not silent."""
     z = torch.zeros(1)
@@ -113,6 +135,7 @@ def test_stubs_raise_not_implemented() -> None:
         (causal_conv1d.triton, (z, z, z), dict(bias=None, activation=None)),
         (causal_conv1d.flash,  (z, z, z), dict(bias=None, activation=None)),
         (experts.flash, (fake_self, z, z, z), {}),
+        (gmm.flash, (z, z, z), {}),
     ]
     for fn, args, kwargs in cases:
         try:
@@ -148,6 +171,8 @@ _TESTS = [
     test_chunk_and_recurrent_share_signature,
     test_causal_conv1d_signature,
     test_experts_signature_matches_hf_dispatch,
+    test_shared_gmm_present_and_signature,
+    test_experts_imports_shared_gmm,
     test_stubs_raise_not_implemented,
     test_package_does_not_import_alloy,
 ]

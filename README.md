@@ -20,13 +20,20 @@ Currently shipped:
 ```
 hf_npu_binder/
 ├── __init__.py
+├── shared/                                   # cross-family NPU primitives
+│   └── gmm.py                                #   grouped matmul (used by every MoE family)
 └── qwen3_5_moe/
     ├── __init__.py
     ├── chunk_gated_delta_rule.py            # def triton(...) / def flash(...)
     ├── fused_recurrent_gated_delta_rule.py
     ├── causal_conv1d.py
+    ├── experts.py                            # composite: permute + gmm + swiglu + gmm + unpermute
     └── kernels/                              # ported triton kernels land here
 ```
+
+Family-specific operators (`qwen3_5_moe.experts.flash`) compose primitives
+from `shared/` rather than each re-implementing them. Add a new MoE family
+by creating `<family>/experts.py` that imports from `shared.gmm`.
 
 ## Install
 

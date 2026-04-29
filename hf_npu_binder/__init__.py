@@ -13,6 +13,7 @@ implementation's body, so this package loads on a CPU box.
 from __future__ import annotations
 
 from . import qwen3_5_moe  # noqa: F401  -- re-export for convenience
+from . import shared       # noqa: F401  -- cross-family primitives
 
-__all__ = ["qwen3_5_moe"]
+__all__ = ["qwen3_5_moe", "shared"]
 __version__ = "0.0.1"

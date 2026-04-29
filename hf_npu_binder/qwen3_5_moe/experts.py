@@ -4,10 +4,15 @@ This is the **whole** experts forward — not just grouped matmul. The real
 NPU fast path chains five fused ops:
 
     npu_moe_token_permute      gather tokens by expert assignment
-    npu_grouped_matmul         gate_up projection (this is the "GMM")
+    shared.gmm.flash           gate_up projection (grouped matmul primitive)
     npu_swiglu                 fused gate * silu(up) activation
-    npu_grouped_matmul         down projection (second GMM)
+    shared.gmm.flash           down projection (second grouped matmul)
     npu_moe_token_unpermute    scatter tokens back, applying routing weights
+
+The grouped-matmul primitive lives in ``hf_npu_binder.shared.gmm`` so other
+MoE families (mistral_moe, dbrx, ...) can reuse the exact same wrapper +
+custom backward without duplication. ``experts.flash`` here is purely the
+qwen3_5-specific composition.
 
 Reference: ``mindspeed_mm/fsdp/models/qwen3_5_moe/modeling_qwen3_5_moe.py``
 ``Qwen3_5MoeExperts.forward`` and ``mindspeed_mm/models/common/gmm.py``.
@@ -32,6 +37,10 @@ this module loads on a CPU box.
 from __future__ import annotations
 
 import torch
+
+# Re-exported for convenience — call sites inside experts.flash will use
+# ``gmm_flash(...)`` rather than reaching across packages each time.
+from ..shared.gmm import flash as gmm_flash  # noqa: F401  -- staged for the real impl
 
 
 def flash(
