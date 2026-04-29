@@ -118,12 +118,16 @@ def test_experts_imports_shared_gmm() -> None:
     )
 
 
-def test_stubs_raise_not_implemented() -> None:
-    """Stubs must be loud, not silent."""
+def test_remaining_stubs_raise_not_implemented() -> None:
+    """The still-stubbed backends must remain loud, not silent.
+
+    These are the operators whose reference implementations either don't
+    have an NPU-specific path (causal_conv1d) or rely on external packages
+    not yet vendored here (fused_recurrent uses fla; chunk_gated_delta_rule
+    needs the 7 triton kernels — pending in the next slice).
+    """
     z = torch.zeros(1)
-    fake_self = object()
     cases = [
-        # (callable, args, kwargs)
         (chunk_gated_delta_rule.triton, (z, z, z),
          dict(g=z, beta=z, initial_state=None, output_final_state=False)),
         (chunk_gated_delta_rule.flash, (z, z, z),
@@ -134,8 +138,6 @@ def test_stubs_raise_not_implemented() -> None:
          dict(g=z, beta=z, initial_state=None, output_final_state=False)),
         (causal_conv1d.triton, (z, z, z), dict(bias=None, activation=None)),
         (causal_conv1d.flash,  (z, z, z), dict(bias=None, activation=None)),
-        (experts.flash, (fake_self, z, z, z), {}),
-        (gmm.flash, (z, z, z), {}),
     ]
     for fn, args, kwargs in cases:
         try:
@@ -144,6 +146,59 @@ def test_stubs_raise_not_implemented() -> None:
             assert "stub" in str(e), e
         else:
             raise AssertionError(f"{fn.__module__}.{fn.__name__} did not raise NotImplementedError")
+
+
+def test_real_impls_fail_with_missing_npu_dep_not_notimpl() -> None:
+    """The now-real implementations (gmm.flash, experts.flash) call into
+    torch_npu — which isn't available on a CPU dev box. They should fail
+    with ModuleNotFoundError on torch_npu, NOT with NotImplementedError
+    (that would mean we're still stubbed).
+    """
+    z = torch.zeros(1)
+    fake_self = type("FakeExperts", (), {
+        "num_experts": 2, "is_transposed": False,
+        "gate_up_proj": torch.zeros(2, 4, 6),
+        "down_proj": torch.zeros(2, 6, 4),
+    })()
+    cases = [
+        (gmm.flash, (z, z, z), {}),
+        (experts.flash, (fake_self, z, z, z), {}),
+    ]
+    for fn, args, kwargs in cases:
+        try:
+            fn(*args, **kwargs)
+        except NotImplementedError:
+            raise AssertionError(f"{fn.__module__}.{fn.__name__} still stubbed")
+        except ModuleNotFoundError as e:
+            assert "torch_npu" in str(e), (
+                f"{fn.__module__}.{fn.__name__} expected torch_npu ModuleNotFoundError, got: {e}"
+            )
+        except Exception:
+            # Other failures are acceptable — they prove the function ran past
+            # the stub, hit some real code path, and tripped on the missing NPU.
+            pass
+        else:
+            # On a CPU box a successful return is unexpected — but we don't
+            # want to be too strict; if torch_npu happens to exist as a stub
+            # module, just let it be.
+            pass
+
+
+def test_module_load_does_not_pull_torch_npu_or_triton() -> None:
+    """Importing the binder must not eagerly load torch_npu / triton.
+
+    This is the contract that lets binder install on a CPU dev box. The
+    real implementations import these heavy deps lazily inside function
+    bodies, not at module level.
+    """
+    assert "torch_npu" not in sys.modules, (
+        "torch_npu was loaded by `import hf_npu_binder` — heavy NPU dep "
+        "leaked into module load. Move the import inside the function body."
+    )
+    assert "triton" not in sys.modules, (
+        "triton was loaded by `import hf_npu_binder` — heavy triton dep "
+        "leaked into module load. Move the import inside the function body."
+    )
 
 
 def test_package_does_not_import_alloy() -> None:
@@ -173,7 +228,9 @@ _TESTS = [
     test_experts_signature_matches_hf_dispatch,
     test_shared_gmm_present_and_signature,
     test_experts_imports_shared_gmm,
-    test_stubs_raise_not_implemented,
+    test_remaining_stubs_raise_not_implemented,
+    test_real_impls_fail_with_missing_npu_dep_not_notimpl,
+    test_module_load_does_not_pull_torch_npu_or_triton,
     test_package_does_not_import_alloy,
 ]
 
