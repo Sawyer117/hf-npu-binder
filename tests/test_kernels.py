@@ -128,10 +128,6 @@ def test_remaining_stubs_raise_not_implemented() -> None:
     """
     z = torch.zeros(1)
     cases = [
-        (chunk_gated_delta_rule.triton, (z, z, z),
-         dict(g=z, beta=z, initial_state=None, output_final_state=False)),
-        (chunk_gated_delta_rule.flash, (z, z, z),
-         dict(g=z, beta=z, initial_state=None, output_final_state=False)),
         (fused_recurrent_gated_delta_rule.triton, (z, z, z),
          dict(g=z, beta=z, initial_state=None, output_final_state=False)),
         (fused_recurrent_gated_delta_rule.flash, (z, z, z),
@@ -155,6 +151,12 @@ def test_real_impls_fail_with_missing_npu_dep_not_notimpl() -> None:
     (that would mean we're still stubbed).
     """
     z = torch.zeros(1)
+    # Validation-friendly tensors so we get past _validate() and hit the
+    # actual NPU call path. Real shapes don't matter on a CPU box; we only
+    # need to confirm the path tries to import torch_npu / load triton.
+    bf = torch.zeros(1, 2, 1, 4, dtype=torch.bfloat16)            # [B, T, H, K] for chunk_rule
+    beta_bf = torch.zeros(1, 2, 1, dtype=torch.bfloat16)          # [B, T, H]
+    g_bf = torch.zeros(1, 2, 1, dtype=torch.bfloat16)
     fake_self = type("FakeExperts", (), {
         "num_experts": 2, "is_transposed": False,
         "gate_up_proj": torch.zeros(2, 4, 6),
@@ -163,6 +165,10 @@ def test_real_impls_fail_with_missing_npu_dep_not_notimpl() -> None:
     cases = [
         (gmm.flash, (z, z, z), {}),
         (experts.flash, (fake_self, z, z, z), {}),
+        (chunk_gated_delta_rule.triton, (bf, bf, bf),
+         dict(g=g_bf, beta=beta_bf, initial_state=None, output_final_state=False)),
+        (chunk_gated_delta_rule.flash, (bf, bf, bf),
+         dict(g=g_bf, beta=beta_bf, initial_state=None, output_final_state=False)),
     ]
     for fn, args, kwargs in cases:
         try:
@@ -170,17 +176,17 @@ def test_real_impls_fail_with_missing_npu_dep_not_notimpl() -> None:
         except NotImplementedError:
             raise AssertionError(f"{fn.__module__}.{fn.__name__} still stubbed")
         except ModuleNotFoundError as e:
-            assert "torch_npu" in str(e), (
-                f"{fn.__module__}.{fn.__name__} expected torch_npu ModuleNotFoundError, got: {e}"
+            # Either torch_npu (gmm.flash, experts.flash, chunk_*.flash) or
+            # triton (chunk_*.triton, chunk_*.flash for the kernel imports).
+            msg = str(e)
+            assert "torch_npu" in msg or "triton" in msg, (
+                f"{fn.__module__}.{fn.__name__} expected torch_npu/triton "
+                f"ModuleNotFoundError, got: {e}"
             )
         except Exception:
-            # Other failures are acceptable — they prove the function ran past
-            # the stub, hit some real code path, and tripped on the missing NPU.
-            pass
-        else:
-            # On a CPU box a successful return is unexpected — but we don't
-            # want to be too strict; if torch_npu happens to exist as a stub
-            # module, just let it be.
+            # Other failures (shape mismatches, attribute errors, etc.) are
+            # acceptable — they prove the function ran past any stub, tried
+            # to actually compute, and tripped on the missing NPU/triton env.
             pass
 
 
