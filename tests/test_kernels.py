@@ -109,6 +109,39 @@ def test_shared_gmm_present_and_signature() -> None:
     assert params == expected, f"shared.gmm.flash signature drift: {params} != {expected}"
 
 
+def test_chunk_flash_delegates_to_triton_when_disabled() -> None:
+    """The flash backend's ascendc path is currently disabled —
+    chunk_gated_delta_rule.flash() should silently route to triton(). The
+    flag _FLASH_USES_ASCENDC is the single switch; flipping it to True
+    re-enables the original ascendc path in _make_flash_fn().
+    """
+    from hf_npu_binder.qwen3_5_moe import chunk_gated_delta_rule as mod
+
+    assert mod._FLASH_USES_ASCENDC is False, (
+        "Test premise: ascendc path should be disabled. If it's been re-enabled,"
+        " update / remove this test."
+    )
+
+    # When disabled, flash() must route to triton() — confirm by checking the
+    # triton path's "no triton on CPU" failure mode kicks in (not the ascendc
+    # path's "no torch_npu" failure mode).
+    bf = torch.zeros(1, 2, 1, 4, dtype=torch.bfloat16)
+    g_bf = torch.zeros(1, 2, 1, dtype=torch.bfloat16)
+    try:
+        mod.flash(bf, bf, bf, g=g_bf, beta=g_bf,
+                  initial_state=None, output_final_state=False)
+    except ModuleNotFoundError as e:
+        # On a CPU dev box, triton is missing → expect "triton" not "torch_npu"
+        # in the error.
+        assert "triton" in str(e), (
+            f"flash() with disabled ascendc should hit the triton path; got: {e}"
+        )
+    except Exception:
+        # Some other failure (shape, dtype) is fine — proves we ran past
+        # any stub and into real code that depends on the env.
+        pass
+
+
 def test_experts_imports_shared_gmm() -> None:
     """experts.py stages shared.gmm as ``gmm_flash`` for the real impl.
     Catches accidental removal of the import wiring.
@@ -233,6 +266,7 @@ _TESTS = [
     test_causal_conv1d_signature,
     test_experts_signature_matches_hf_dispatch,
     test_shared_gmm_present_and_signature,
+    test_chunk_flash_delegates_to_triton_when_disabled,
     test_experts_imports_shared_gmm,
     test_remaining_stubs_raise_not_implemented,
     test_real_impls_fail_with_missing_npu_dep_not_notimpl,

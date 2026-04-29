@@ -215,7 +215,16 @@ def triton(
 # Flash backend — ascendc fwd_h / fwd_o + bwd kernels via torch.ops.npu,
 # vendored triton kernels for the lighter prep ops.
 # ---------------------------------------------------------------------------
-_FlashFn = None  # populated on first call to flash()
+# DISABLED for now: the ascendc kernel chain in _make_flash_fn() hasn't been
+# verified end-to-end on real hardware yet. Until it has, ``flash()`` below
+# silently delegates to ``triton()`` so callers that pick ``prefer="flash"``
+# (via the alloy bridge or directly) still get a working forward instead of
+# a runtime crash. The factory + Function class are kept intact below so
+# that flipping this flag to ``True`` re-enables the ascendc path with no
+# other code changes.
+_FLASH_USES_ASCENDC = False
+
+_FlashFn = None  # populated on first call to flash() (only when _FLASH_USES_ASCENDC=True)
 
 
 def _make_flash_fn():
@@ -395,7 +404,22 @@ def flash(
     output_final_state: bool = False,
     use_qk_l2norm_in_kernel: bool = False,
 ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
-    """ascendc + triton hybrid chunk_gated_delta_rule (prefill path)."""
+    """ascendc + triton hybrid chunk_gated_delta_rule (prefill path).
+
+    Currently delegates to :func:`triton` because the ascendc kernel chain
+    hasn't been verified end-to-end yet (see ``_FLASH_USES_ASCENDC`` at the
+    top of this section). Set the flag to ``True`` to exercise the real
+    ascendc path inside ``_make_flash_fn()``.
+    """
+    if not _FLASH_USES_ASCENDC:
+        return triton(
+            query, key, value,
+            g=g, beta=beta,
+            initial_state=initial_state,
+            output_final_state=output_final_state,
+            use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+        )
+
     global _FlashFn
     if _FlashFn is None:
         _FlashFn = _make_flash_fn()
