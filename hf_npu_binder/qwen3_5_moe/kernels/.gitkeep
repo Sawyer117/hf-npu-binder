@@ -1,0 +1,2 @@
+# Real triton kernels (chunk_delta_h.py, chunk_o.py, ...) ported from
+# mindspeed_mm/fsdp/models/qwen3_5/triton/ land here once they exist.

@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hf-npu-binder"
+version = "0.0.1"
+description = "Optional NPU / triton fast-path implementations for HuggingFace-native models. Plugs into alloy's IMPL_REGISTRY without modifying it."
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [{ name = "Sawyer117" }]
+dependencies = [
+    "torch>=2.4",
+]
+
+# Heavy NPU / triton deps stay optional. The binder package itself imports
+# fine on a vanilla CPU box; only the implementation modules pull torch_npu
+# / triton lazily when a matching backend is actually selected at runtime.
+#
+# This package does not depend on alloy. Consumers that want alloy
+# integration import a bridge module shipped on the alloy side
+# (``alloy.integrations.hf_npu_binder``).
+[project.optional-dependencies]
+npu = ["torch_npu"]
+triton = ["triton"]
+
+[tool.setuptools.packages.find]
+include = ["hf_npu_binder*"]
