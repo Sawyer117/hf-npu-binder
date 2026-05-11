@@ -53,7 +53,12 @@ except ImportError:
     import triton.language as al
 
 
-LOG2_E: tl.constexpr = 1.4426950408889634
+# Use the call form ``tl.constexpr(...)`` rather than the type-annotation
+# form ``LOG2_E: tl.constexpr = ...``. Newer Triton (3.2.1+, including the
+# bundled triton-ascend release) strictly checks global-variable access
+# from @triton.jit functions and only the call form is reliably picked up
+# across both upstream Triton and triton-ascend.
+LOG2_E = tl.constexpr(1.4426950408889634)
 
 
 # ---------------------------------------------------------------------------
