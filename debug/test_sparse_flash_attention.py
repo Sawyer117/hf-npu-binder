@@ -121,62 +121,162 @@ def _stats(name: str, a: torch.Tensor, b: torch.Tensor) -> tuple[bool, str]:
 
 
 # ---------------------------------------------------------------------------
+# Timed runs with warmup / steady-state separation
+# ---------------------------------------------------------------------------
+def _sync_fn(device: torch.device):
+    if device.type == "npu":
+        return torch.npu.synchronize
+    if device.type == "cuda":
+        return torch.cuda.synchronize
+    return lambda: None
+
+
+def _timed_fwd(
+    case: Case, device: torch.device, *, warmup: int, iters: int,
+) -> tuple[float, float, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Bench a forward of the triton kernel. Returns
+    (compile_ms, steady_ms_median, out, q_for_bwd, kv_for_bwd, sink_for_bwd).
+
+    First call is timed separately as ``compile_ms`` — it includes Triton's
+    AOT compile (often several seconds on Ascend NPU for novel ``constexpr``
+    signatures). Then ``warmup`` untimed calls, then ``iters`` timed calls
+    whose median is the steady-state ms.
+
+    Returned q/kv/sink are the requires_grad-True inputs used in the LAST
+    timed call, so the caller can chain a backward bench on them.
+    """
+    from hf_npu_binder.deepseek_v4 import sparse_flash_attention as sfa
+    sync = _sync_fn(device)
+
+    # First call — compile + run.
+    q, kv, sink, topk, scale = make_inputs(case, device)
+    sync()
+    t0 = time.perf_counter()
+    out = sfa.kernel(q, kv, sink, topk, scale).to(torch.bfloat16)
+    sync()
+    compile_ms = (time.perf_counter() - t0) * 1000.0
+
+    # Warmup — untimed, just to ensure caches are hot for the timed iters.
+    for _ in range(warmup):
+        q, kv, sink, _, _ = make_inputs(case, device)
+        _ = sfa.kernel(q, kv, sink, topk, scale).to(torch.bfloat16)
+    sync()
+
+    # Timed iters — each rebuilds inputs so we capture full fwd cost (incl
+    # any per-call alloc); reusing the SAME inputs would let allocator reuse
+    # buffers and underestimate.
+    times = []
+    for _ in range(iters):
+        q, kv, sink, _, _ = make_inputs(case, device)
+        sync()
+        t0 = time.perf_counter()
+        out = sfa.kernel(q, kv, sink, topk, scale).to(torch.bfloat16)
+        sync()
+        times.append((time.perf_counter() - t0) * 1000.0)
+    times.sort()
+    steady_ms = times[len(times) // 2]
+
+    # Re-do once with requires_grad alive so the bwd bench can use the
+    # autograd graph from a known steady-state forward.
+    q, kv, sink, _, _ = make_inputs(case, device)
+    out = sfa.kernel(q, kv, sink, topk, scale).to(torch.bfloat16)
+    return compile_ms, steady_ms, out, q, kv, sink
+
+
+def _timed_bwd(
+    out: torch.Tensor, q: torch.Tensor, kv: torch.Tensor, sink: torch.Tensor,
+    grad_out: torch.Tensor, *,
+    case: Case, device: torch.device, warmup: int, iters: int,
+) -> tuple[float, float, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Bench backward. Same compile-vs-steady split as ``_timed_fwd``.
+    Each timed iter does fresh fwd+bwd (so autograd graph is rebuildable)."""
+    from hf_npu_binder.deepseek_v4 import sparse_flash_attention as sfa
+    sync = _sync_fn(device)
+
+    # First bwd — compile dq + dkv kernels.
+    sync()
+    t0 = time.perf_counter()
+    out.backward(grad_out, retain_graph=False)
+    sync()
+    compile_ms = (time.perf_counter() - t0) * 1000.0
+
+    # Save grads from the compile run (used by correctness compare below).
+    grad_q = q.grad.detach().clone()
+    grad_kv = kv.grad.detach().clone()
+    grad_sink = sink.grad.detach().clone()
+
+    # Warmup — fresh fwd+bwd, untimed.
+    _, _, scale = case.B, case.S, (1.0 / case.D) ** 0.5
+    for _ in range(warmup):
+        q, kv, sink, topk, _ = make_inputs(case, device)
+        o = sfa.kernel(q, kv, sink, topk, scale).to(torch.bfloat16)
+        o.backward(grad_out, retain_graph=False)
+    sync()
+
+    # Timed iters — fresh fwd+bwd each iter, only the bwd is timed.
+    times = []
+    for _ in range(iters):
+        q, kv, sink, topk, _ = make_inputs(case, device)
+        o = sfa.kernel(q, kv, sink, topk, scale).to(torch.bfloat16)
+        sync()
+        t0 = time.perf_counter()
+        o.backward(grad_out, retain_graph=False)
+        sync()
+        times.append((time.perf_counter() - t0) * 1000.0)
+    times.sort()
+    steady_ms = times[len(times) // 2]
+
+    return compile_ms, steady_ms, grad_q, grad_kv, grad_sink
+
+
+# ---------------------------------------------------------------------------
 # One case driver
 # ---------------------------------------------------------------------------
-def run_case(case: Case, device: torch.device, verbose: bool = True) -> bool:
+def run_case(
+    case: Case, device: torch.device,
+    *, warmup: int = 2, iters: int = 5, verbose: bool = True,
+) -> bool:
     if verbose:
         print(f"\n--- {case.name}  B={case.B} S={case.S} H={case.H} D={case.D} N={case.N} TOPK={case.TOPK} ---")
 
     from hf_npu_binder.deepseek_v4 import sparse_flash_attention as sfa
+    sync = _sync_fn(device)
 
-    # ---- triton kernel side ----
-    q_t, kv_t, sink_t, topk, scale = make_inputs(case, device)
-    grad_out = torch.randn_like(q_t)
+    # Reuse the SAME grad_out across triton + ref so the autograd outputs
+    # are directly comparable.
+    grad_out_template = torch.randn(case.S, case.B, case.H, case.D, device=device, dtype=torch.bfloat16)
 
-    sync = getattr(torch.npu, "synchronize", None) if device.type == "npu" else None
+    # ---- TRITON path (timed) ----
+    fwd_compile_ms, fwd_steady_ms, out_triton, q_t, kv_t, sink_t = _timed_fwd(
+        case, device, warmup=warmup, iters=iters,
+    )
+    bwd_compile_ms, bwd_steady_ms, grad_q_triton, grad_kv_triton, grad_sink_triton = _timed_bwd(
+        out_triton, q_t, kv_t, sink_t, grad_out_template,
+        case=case, device=device, warmup=warmup, iters=iters,
+    )
 
-    if sync: sync()
-    t0 = time.perf_counter()
-    out_triton = sfa.kernel(q_t, kv_t, sink_t, topk, scale).to(torch.bfloat16)
-    if sync: sync()
-    fwd_ms_triton = (time.perf_counter() - t0) * 1000.0
-
-    if sync: sync()
-    t0 = time.perf_counter()
-    out_triton.backward(grad_out)
-    if sync: sync()
-    bwd_ms_triton = (time.perf_counter() - t0) * 1000.0
-
-    grad_q_triton = q_t.grad.detach().clone()
-    grad_kv_triton = kv_t.grad.detach().clone()
-    grad_sink_triton = sink_t.grad.detach().clone()
-
-    # ---- pytorch reference side ----
-    q_r, kv_r, sink_r, _, _ = make_inputs(case, device)
-    # reuse the SAME topk_idxs + grad_out so seeds align bit-for-bit
-    # (make_inputs uses the same seed for everything)
-
-    if sync: sync()
+    # ---- REFERENCE path (one shot — pytorch loop, no compile to amortise) ----
+    q_r, kv_r, sink_r, topk, scale = make_inputs(case, device)
+    sync()
     t0 = time.perf_counter()
     out_ref = sfa.pytorch_reference(q_r, kv_r, sink_r, topk, scale).to(torch.bfloat16)
-    if sync: sync()
-    fwd_ms_ref = (time.perf_counter() - t0) * 1000.0
+    sync()
+    fwd_ref_ms = (time.perf_counter() - t0) * 1000.0
 
-    if sync: sync()
+    sync()
     t0 = time.perf_counter()
-    out_ref.backward(grad_out)
-    if sync: sync()
-    bwd_ms_ref = (time.perf_counter() - t0) * 1000.0
-
+    out_ref.backward(grad_out_template)
+    sync()
+    bwd_ref_ms = (time.perf_counter() - t0) * 1000.0
     grad_q_ref = q_r.grad.detach().clone()
     grad_kv_ref = kv_r.grad.detach().clone()
     grad_sink_ref = sink_r.grad.detach().clone()
 
-    # ---- compare ----
+    # ---- report ----
     all_pass = True
     if verbose:
-        print(f"   fwd  triton {fwd_ms_triton:>9.2f} ms   ref {fwd_ms_ref:>10.2f} ms")
-        print(f"   bwd  triton {bwd_ms_triton:>9.2f} ms   ref {bwd_ms_ref:>10.2f} ms")
+        print(f"   fwd  triton compile={fwd_compile_ms:>10.2f} ms  steady={fwd_steady_ms:>9.2f} ms (median of {iters})   ref={fwd_ref_ms:>10.2f} ms")
+        print(f"   bwd  triton compile={bwd_compile_ms:>10.2f} ms  steady={bwd_steady_ms:>9.2f} ms (median of {iters})   ref={bwd_ref_ms:>10.2f} ms")
 
     for name, a, b in [
         ("forward",   out_triton,        out_ref),
@@ -199,6 +299,8 @@ def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--device", default=None, help="npu / cuda / cpu (default: npu if available, else cuda, else cpu)")
     p.add_argument("--cases", default=None, help="comma-separated subset of test case names")
+    p.add_argument("--warmup", type=int, default=2, help="untimed warmup iters after first compile-call (default 2)")
+    p.add_argument("--iters", type=int, default=5, help="timed iters for steady-state median (default 5)")
     args = p.parse_args()
 
     npu_mod = _try_import_npu()
@@ -237,7 +339,7 @@ def main():
     results: list[tuple[str, bool]] = []
     for case in selected:
         try:
-            ok = run_case(case, device)
+            ok = run_case(case, device, warmup=args.warmup, iters=args.iters)
         except Exception as e:
             print(f"\n--- {case.name} --- EXCEPTION")
             print(f"   {type(e).__name__}: {e}")
