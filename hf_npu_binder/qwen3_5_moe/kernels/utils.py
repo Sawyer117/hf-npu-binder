@@ -304,15 +304,25 @@ def get_autotune_config(
         list(limit_auto_multi_buffer_of_local_buffer_list),
     ):
 
+        # triton-ascend 3.2.1+ moved NPU-specific autotune knobs
+        # (``multibuffer`` / ``unit_flag`` / ``set_workspace_multibuffer`` /
+        # ``tile_mix_vector_loop`` / ...) out of ``triton.Config.__init__``
+        # kwargs and into the ``kwargs`` *dict* (first positional arg).
+        # The Ascend backend reads them from ``metadata`` (see triton-ascend's
+        # ``third_party/ascend/backend/compiler.py``: ``metadata.get(...)``);
+        # the kernel function itself never sees them. Older triton-ascend
+        # versions monkey-patched ``Config`` to accept them as named kwargs,
+        # but 3.2.1+ uses the upstream ``Config.__init__`` signature
+        # (``kwargs, num_warps, num_stages, num_ctas, ...``), so passing
+        # ``multibuffer=...`` directly raises ``TypeError``.
         if limit_auto_multi_buffer_only_for_local_buffer:
             configs.append(
-                triton.Config(
-                    {},
-                    multibuffer=multibuffer,
-                    unit_flag=unit_flag,
-                    limit_auto_multi_buffer_only_for_local_buffer=limit_auto_multi_buffer_only_for_local_buffer,
-                    limit_auto_multi_buffer_of_local_buffer=limit_auto_multi_buffer_of_local_buffer,
-                )
+                triton.Config({
+                    "multibuffer": multibuffer,
+                    "unit_flag": unit_flag,
+                    "limit_auto_multi_buffer_only_for_local_buffer": limit_auto_multi_buffer_only_for_local_buffer,
+                    "limit_auto_multi_buffer_of_local_buffer": limit_auto_multi_buffer_of_local_buffer,
+                })
             )
         else:
             for (
@@ -327,17 +337,16 @@ def get_autotune_config(
                 list(tile_mix_cube_loop_num_list),
             ):
                 configs.append(
-                    triton.Config(
-                        {},
-                        multibuffer=multibuffer,
-                        unit_flag=unit_flag,
-                        limit_auto_multi_buffer_only_for_local_buffer=limit_auto_multi_buffer_only_for_local_buffer,
-                        limit_auto_multi_buffer_of_local_buffer=limit_auto_multi_buffer_of_local_buffer,
-                        set_workspace_multibuffer=set_workspace_multibuffer,
-                        enable_hivm_auto_cv_balance=enable_hivm_auto_cv_balance,
-                        tile_mix_vector_loop=tile_mix_vector_loop,
-                        tile_mix_cube_loop=tile_mix_cube_loop,
-                    )
+                    triton.Config({
+                        "multibuffer": multibuffer,
+                        "unit_flag": unit_flag,
+                        "limit_auto_multi_buffer_only_for_local_buffer": limit_auto_multi_buffer_only_for_local_buffer,
+                        "limit_auto_multi_buffer_of_local_buffer": limit_auto_multi_buffer_of_local_buffer,
+                        "set_workspace_multibuffer": set_workspace_multibuffer,
+                        "enable_hivm_auto_cv_balance": enable_hivm_auto_cv_balance,
+                        "tile_mix_vector_loop": tile_mix_vector_loop,
+                        "tile_mix_cube_loop": tile_mix_cube_loop,
+                    })
                 )
     return configs
 
