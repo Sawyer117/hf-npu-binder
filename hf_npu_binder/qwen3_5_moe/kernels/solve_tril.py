@@ -8,6 +8,19 @@ import torch
 import triton
 import triton.language as tl
 
+# ``extract_slice`` is an Ascend-specific intrinsic. On the canonical
+# triton-ascend 3.2.1+ install it lives under
+# ``triton.language.extra.cann.extension``; older monkey-patched builds
+# exposed it directly on ``triton.language``. Import under the ``al``
+# alias (matches MindSpeed-LLM and the deepseek_v4 SFA port). On CPU /
+# non-Ascend triton, ``extra.cann.extension`` is missing — falling back
+# to plain ``triton.language`` lets the module import (kernel invocation
+# still fails clearly later, just not at import time).
+try:
+    import triton.language.extra.cann.extension as al
+except ImportError:
+    import triton.language as al
+
 from .utils import prepare_chunk_indices, make_tensor_descriptor, input_guard, is_amd
 
 
@@ -70,7 +83,7 @@ def solve_tril_16x16_kernel(
         b_A_neg = -b_A_raw
         b_A = b_A_neg * m_A
         for i in range(2, min(16, T_eff - tile_row)):
-            slice_res = tl.extract_slice(b_A_neg, [i, 0], [1, 16], [1, 1])
+            slice_res = al.extract_slice(b_A_neg, [i, 0], [1, 16], [1, 1])
             b_a_val = tl.reshape(slice_res, (16,), can_reorder=True)
             dot_prod = tl.sum(b_a_val[:, None] * b_A, 0)
             b_a_update = b_a_val + dot_prod
@@ -223,7 +236,7 @@ def solve_tril_64x64_kernel(
         # Fully On-Chip
         limit = min(64, T_eff - tile_row)
         for i in range(2, limit):
-            slice_res = tl.extract_slice(b_A_neg, [i, 0], [1, 64], [1, 1])
+            slice_res = al.extract_slice(b_A_neg, [i, 0], [1, 64], [1, 1])
             b_a_val = tl.reshape(slice_res, (64,), can_reorder=True)
             dot_prod = tl.sum(b_a_val[:, None] * b_A, 0)
             b_a_update = b_a_val + dot_prod
