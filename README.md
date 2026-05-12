@@ -37,10 +37,15 @@ by creating `<family>/experts.py` that imports from `shared.gmm`.
 
 ## Install
 
+For a full NPU dev box walkthrough (CANN + torch_npu + triton-ascend +
+transformers source install + alloy + binder), see [INSTALL.md](INSTALL.md).
+Short form:
+
 ```bash
 pip install -e .
-# pip install hf-npu-binder[npu]      # later, when torch_npu is needed
-# pip install hf-npu-binder[triton]
+# pip install hf-npu-binder[npu]                                              # adds torch_npu
+# pip install hf-npu-binder[triton] \
+#     --extra-index-url=https://triton-ascend.osinfra.cn/pypi/simple          # adds triton-ascend
 ```
 
 ## Use
