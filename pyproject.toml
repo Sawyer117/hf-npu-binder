@@ -15,11 +15,17 @@ dependencies = [
     # torch_npu 2.9.x) are validated in practice. No upper bound.
     "torch>=2.7",
     # DSV4 CSA fast-path is built against the attention-interface contract
-    # introduced by huggingface/transformers#45892 (merged on main, no
-    # tagged release yet — next release is 5.8.0). qwen3.5 GDN bf16
-    # byte-equivalence was first verified at 5.7.0; 5.8.0 is the union
-    # floor that covers both.
-    "transformers>=5.8.0",
+    # introduced by huggingface/transformers#45892 (merge commit
+    # a1b77cca4e), which is on main but not yet in a tagged release
+    # (current main reports ``5.8.0.dev0``; next tag will be 5.8.0).
+    # Until then the realistic install is source:
+    #     git clone https://github.com/huggingface/transformers
+    #     cd transformers && git checkout a1b77cca4e   # or any main HEAD past it
+    #     pip install -e .
+    # The ``.dev0`` floor lets pip resolve against that editable install;
+    # once 5.8.0 ships this still matches. qwen3.5 GDN bf16
+    # byte-equivalence is satisfied by the same floor.
+    "transformers>=5.8.0.dev0",
 ]
 
 # Heavy NPU / triton deps stay optional. The binder package itself imports
