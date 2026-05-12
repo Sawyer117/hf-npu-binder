@@ -60,7 +60,11 @@ DEFAULTS: dict[str, dict[str, str]] = {
     "qwen3_5_moe.experts": {
         "auto":   "flash",
         "flash":  "flash",
-        "triton": "torch",   # no triton experts; HF dispatch falls back to torch
+        # No triton experts kernel; fall back to HF's "eager" reference
+        # impl. ``"torch"`` is NOT a valid HF experts_implementation value
+        # (HF's _check_and_adjust_experts_implementation rejects unknown
+        # names hard); the alloy-convention name doesn't translate here.
+        "triton": "eager",
     },
     # ``deepseek_v4.sparse_flash_attention``: triton BHSD adapter wired
     # (vendored MindSpeed kernel + combined-topk trick). ascendc adapter
