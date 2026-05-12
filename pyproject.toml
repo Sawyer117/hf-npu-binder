@@ -10,19 +10,45 @@ readme = "README.md"
 requires-python = ">=3.10"
 authors = [{ name = "Sawyer117" }]
 dependencies = [
-    "torch>=2.4",
+    # Both torch 2.7.x (with torch_npu 2.7.1, the triton-ascend 3.2.1
+    # docs' reference combo) and torch 2.9.x (with the matching
+    # torch_npu 2.9.x) are validated in practice. No upper bound.
+    "torch>=2.7",
+    # DSV4 CSA fast-path is built against the attention-interface contract
+    # introduced by huggingface/transformers#45892 (merged on main, no
+    # tagged release yet — next release is 5.8.0). qwen3.5 GDN bf16
+    # byte-equivalence was first verified at 5.7.0; 5.8.0 is the union
+    # floor that covers both.
+    "transformers>=5.8.0",
 ]
 
 # Heavy NPU / triton deps stay optional. The binder package itself imports
 # fine on a vanilla CPU box; only the implementation modules pull torch_npu
 # / triton lazily when a matching backend is actually selected at runtime.
 #
+# ``triton-ascend`` is the Ascend fork of triton (provides
+# ``triton.language.extra.cann.extension``). It is NOT on default PyPI —
+# install from the Ascend osinfra index:
+#
+#     pip install hf-npu-binder[triton] \
+#         --extra-index-url=https://triton-ascend.osinfra.cn/pypi/simple
+#
+# Source build alternative (gitcode mirror, slower path):
+#     git clone https://gitcode.com/Ascend/triton-ascend
+#     cd triton-ascend && pip install -e .
+#
+# System-level deps (NOT pip-installable, document only):
+#   * CANN toolkit >= 9.0.0 recommended for the ascendc backend. Older
+#     CANN versions still load but the aclnnSparseAttnSharedkv host API
+#     dispatches to a slower fallback. Source set_env.sh so
+#     ASCEND_HOME_PATH is set before any op .load().
+#
 # This package does not depend on alloy. Consumers that want alloy
 # integration import a bridge module shipped on the alloy side
 # (``alloy.integrations.hf_npu_binder``).
 [project.optional-dependencies]
-npu = ["torch_npu"]
-triton = ["triton"]
+npu = ["torch_npu>=2.7.1"]
+triton = ["triton-ascend>=3.2.1"]
 
 [tool.setuptools.packages.find]
 include = ["hf_npu_binder*"]
