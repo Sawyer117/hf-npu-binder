@@ -24,12 +24,16 @@ register-able under ``dsv4_csa.attention`` in alloy IMPL_REGISTRY):
                               sink in fused ascendc kernels. Recommended
                               default once compiled.
 
-  :func:`triton`            — would wrap the vendored triton kernel with
-                              MindSpeed-style "combined topk" trick
-                              (concat sliding window indices with
-                              compressed topk picks). Not yet implemented;
-                              the alloy bridge skips registration so CSA
-                              dispatch falls back to alloy's torch impl.
+  :func:`triton`            — wrap the vendored triton kernel by
+                              materialising the sliding-window range as
+                              explicit topk indices concatenated with
+                              the compressor's compressed picks (the
+                              triton kernel doesn't know sliding-window
+                              semantics natively). Total topk width is
+                              constrained by ``CONFIG_MAP``
+                              ({128, 160, 640}); pick alloy's
+                              ``sliding_window`` + ``index_topk`` so the
+                              sum lands on a supported value.
 
 Heavy deps (``triton``, ``torch_npu``, CANN aclnn JIT compile) are
 imported / triggered lazily inside the loaders so this module imports
@@ -250,8 +254,31 @@ def ascendc(
 
 
 # ---------------------------------------------------------------------------
-# alloy-facing entry: triton (combined-topk variant) — not yet implemented
+# alloy-facing entry: triton (combined-topk variant)
 # ---------------------------------------------------------------------------
+def _build_sliding_indices(
+    seq_len: int, sliding_window: int, device: torch.device,
+) -> torch.Tensor:
+    """For each query position q, return the sliding-window KV indices it
+    attends to. Causal: query q sees keys in ``[max(0, q-W+1), q]``.
+
+    Layout matches MindSpeed-LLM's ``DeepSeek4SelfAttention.get_window_topk_idxs``
+    (``mindspeed_llm/.../deepseek4/g2_attention.py``) — valid indices are
+    packed at the FRONT of each row in ascending order, with ``-1``
+    sentinels at the END for early queries (q < window_size - 1). This
+    front-packed layout is what the vendored SFA kernel was developed
+    against; the equivalent back-packed layout has the same softmax
+    semantics but is untested against the kernel's vectorisation
+    assumptions, so we mirror MindSpeed exactly.
+
+    Returns: ``[seq_len, min(seq_len, sliding_window)]`` int32.
+    """
+    base = torch.arange(seq_len, device=device).unsqueeze(1)               # [S, 1]
+    win = torch.arange(min(seq_len, sliding_window), device=device)        # [W']
+    matrix = (base - sliding_window + 1).clamp(min=0) + win                # [S, W']
+    return torch.where(matrix > base, torch.full_like(matrix, -1), matrix).to(torch.int32)
+
+
 def triton(
     module: torch.nn.Module,
     query: torch.Tensor,
@@ -266,27 +293,126 @@ def triton(
     csa_topk_idxs: Optional[torch.Tensor] = None,
     compressed_seq_len: int = 0,
     **kwargs,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """alloy-facing CSA attention via vendored Triton kernel. **Not yet
-    implemented** — requires constructing the MindSpeed-style "combined
-    topk" (sliding-window indices ⨁ compressed topk picks) so a single
-    SFA call covers both attention ranges; the kernel's ``CONFIG_MAP``
-    also constrains the legal total topk widths to {128, 160, 640}, which
-    in turn constrains the compressed_topk values alloy can use.
+) -> tuple[torch.Tensor, None]:
+    """CSA attention via the vendored MindSpeed triton SFA kernel.
 
-    Prefer :func:`ascendc` for production — it uses CANN's fused op
-    which has no such width constraints. This Triton path is a
-    self-contained backup for environments where the CANN
-    ``aclnnSparseAttnSharedkv`` API is unavailable (rare).
+    Matches alloy's ``dsv4_csa.attention`` dispatch contract — same
+    signature as :func:`ascendc` and :func:`_torch_csa_attention`. The
+    triton kernel doesn't know about sliding-window semantics natively;
+    it just does "gather these specific KV positions and attend over
+    them" per query. So this adapter materialises the sliding range as
+    explicit topk indices, concatenates them with the compressor's
+    compressed-range picks, and hands the kernel a single fused
+    ``topk_idxs`` covering both attention ranges.
 
-    The alloy bridge does not register this entry until implemented.
+    The kernel's ``CONFIG_MAP`` only supports total topk widths in
+    ``{128, 160, 640}`` (combined sliding + compressed). Typical DSV4
+    setting is ``sliding_window=128`` + ``index_topk=32`` -> total 160.
+
+    Args:
+        query:           [B, H, S, D] bf16
+        key, value:      [B, 1, kv_len, D] bf16, kv_len = S_sliding + T;
+                         key == value in DSV4 (K=V).
+        attention_mask:  unused — the per-query bias is encoded in
+                         ``csa_topk_idxs`` directly.
+        scaling:         softmax scale.
+        sliding_window:  W, sliding-window width (e.g. 128).
+        s_aux:           [H] float32, per-head learnable sinks.
+        csa_topk_idxs:   [B, S, K] int32, indices into the compressed
+                         range ``[0, T)``. ``-1`` sentinels OK.
+        compressed_seq_len: int T, length of the compressed-KV tail in
+                            the concatenated KV buffer.
+        **kwargs:        ignored.
+
+    Returns:
+        ``(attn_output [B, S, H, D], None)`` — ``attn_weights`` is None
+        because the fused kernel does not surface them. Same BSHD layout
+        the alloy call site expects.
+
+    Prefer :func:`ascendc` when CANN's ``aclnnSparseAttnSharedkv`` op is
+    available — its production path is faster and has no CONFIG_MAP
+    width constraint. This triton wrapper is the self-contained
+    fallback for environments where the CANN op is missing (e.g. older
+    CANN releases that pre-date the aclnn op).
     """
-    raise NotImplementedError(
-        "hf_npu_binder.deepseek_v4.sparse_flash_attention.triton (alloy adapter "
-        "for the vendored triton SFA kernel) is not yet implemented. The "
-        "production path is sparse_flash_attention.ascendc — vendored from "
-        "MindSpeed's npu_sparse_attn_shared_kv aclnn op, no CONFIG_MAP width "
-        "constraint. The alloy bridge does not register this triton adapter, "
-        "so a config request of _dsv4_csa_implementation = 'triton' "
-        "transparently falls back to alloy's torch impl."
-    )
+    if compressed_seq_len <= 0:
+        raise ValueError(
+            "triton adapter only supports CSA layers (compressed_seq_len > 0); "
+            "received compressed_seq_len=0."
+        )
+    if s_aux is None:
+        raise ValueError(
+            "triton adapter requires sinks (s_aux); DSV4 CSA layers always "
+            "carry a per-head learnable sink. Got None."
+        )
+    if csa_topk_idxs is None:
+        raise ValueError(
+            "triton adapter requires csa_topk_idxs from the Lightning Indexer; "
+            "got None. (alloy threads this through DeepseekV4Attention.forward.)"
+        )
+    if sliding_window is None or sliding_window <= 0:
+        raise ValueError(
+            f"triton adapter requires sliding_window > 0; got {sliding_window!r}."
+        )
+
+    SFA = _load_kernel()
+
+    B, H, S, D = query.shape
+    kv_len = key.shape[2]
+    S_sliding = kv_len - compressed_seq_len
+    K = csa_topk_idxs.shape[-1]
+
+    # BHSD -> SBHD for the kernel's preferred layout.
+    q_sbnd = query.permute(2, 0, 1, 3).contiguous()  # [S, B, H, D]
+
+    # Concatenated KV: alloy hands [B, 1, S_sliding+T, D]. Drop the
+    # single KV-head dim and permute to SBD. Matches MindSpeed's
+    # ``torch.cat([ori_kv, cmp_kv], dim=0)`` (sliding first, compressed second).
+    kv_sbd = key.squeeze(1).permute(1, 0, 2).contiguous()  # [S_sliding + T, B, D]
+
+    # ----- combined topk construction --------------------------------------
+    # Sliding part: per-query causal window indices into [0, S_sliding).
+    # Layout (front-packed valid, -1 padding at the end for early queries)
+    # mirrors MindSpeed-LLM's ``get_window_topk_idxs``. Width is
+    # ``min(S, sliding_window)`` — falls back to S only for the rare
+    # short-sequence case.
+    sliding_sw = _build_sliding_indices(S, sliding_window, query.device)  # [S, W']
+    W_eff = sliding_sw.shape[-1]
+    sliding_bsk = sliding_sw.unsqueeze(0).expand(B, S, W_eff)             # [B, S, W']
+
+    # Compressed part: csa_topk_idxs is into [0, T); offset to [S_sliding, kv_len)
+    # in the concatenated buffer, preserving -1 sentinels. MindSpeed's
+    # indexer applies this offset internally; alloy's indexer does not, so
+    # we apply it here.
+    if csa_topk_idxs.dtype != torch.int32:
+        csa_topk_idxs = csa_topk_idxs.to(torch.int32)
+    cmp_offset = csa_topk_idxs + S_sliding
+    cmp_bsk = torch.where(csa_topk_idxs >= 0, cmp_offset, csa_topk_idxs)  # [B, S, K]
+
+    # Stack and re-permute to the kernel's [Seq, Batch, TopK] layout.
+    combined_bsk = torch.cat([sliding_bsk, cmp_bsk], dim=-1)              # [B, S, W'+K]
+    topk_idxs = combined_bsk.permute(1, 0, 2).contiguous()                # [S, B, W'+K]
+
+    # CONFIG_MAP check on the actually-constructed total width. The kernel
+    # raises an identical error on mismatch; doing it here gives the user
+    # a clearer callsite ValueError pointing at the alloy-level knob
+    # (sliding_window + index_topk + seq_len when short).
+    total_topk = W_eff + K
+    from .kernels.sparse_flash_attention_triton import CONFIG_MAP
+    if total_topk not in CONFIG_MAP:
+        raise ValueError(
+            f"triton SFA kernel only supports total topk widths in "
+            f"{sorted(CONFIG_MAP.keys())}; got min(seq_len={S}, "
+            f"sliding_window={sliding_window})={W_eff} + index_topk={K} = "
+            f"{total_topk}. Adjust the DSV4 config so the sum lands on a "
+            f"supported width, or add a TilingBlockConfig entry to CONFIG_MAP."
+        )
+
+    # Sinks: kernel signature documents float32.
+    sinks_f32 = s_aux.float() if s_aux.dtype != torch.float32 else s_aux
+
+    out_sbnd = SFA.apply(q_sbnd, kv_sbd, sinks_f32, topk_idxs, float(scaling))
+
+    # SBHD -> BSHD (alloy's call site immediately transposes to BHSD for RoPE).
+    attn_output = out_sbnd.permute(1, 0, 2, 3).contiguous()  # [B, S, H, D]
+    return attn_output, None

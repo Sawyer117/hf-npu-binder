@@ -62,14 +62,18 @@ DEFAULTS: dict[str, dict[str, str]] = {
         "flash":  "flash",
         "triton": "torch",   # no triton experts; HF dispatch falls back to torch
     },
-    # ``deepseek_v4.sparse_flash_attention``: scaffold only — kernel port
-    # from MindSpeed-LLM pending. "auto" maps to "torch" so an
-    # ``activate(model, "auto")`` still gets a working callable through
-    # alloy's own torch impl registered under ``"dsv4_csa.attention"``.
+    # ``deepseek_v4.sparse_flash_attention``: triton BHSD adapter wired
+    # (vendored MindSpeed kernel + combined-topk trick). ascendc adapter
+    # is also vendored but needs a CANN release that ships
+    # ``aclnnSparseAttnSharedkv`` in ``libopapi.so`` (9.0.0 release;
+    # 9.0.0-beta.1 is too old). ``auto`` -> triton until verified-fast
+    # CANN is the common case; ``ascendc`` stays as an explicit opt-in.
     "deepseek_v4.sparse_flash_attention": {
-        "auto":   "torch",
-        "flash":  "torch",
-        "triton": "torch",
+        "auto":    "triton",
+        "flash":   "triton",  # no flash backend; triton is closest
+        "triton":  "triton",
+        "ascendc": "ascendc",  # opt-in; needs CANN with the aclnn op
+        "torch":   "torch",
     },
 }
 
