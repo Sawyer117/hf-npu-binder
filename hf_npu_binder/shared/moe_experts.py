@@ -121,13 +121,25 @@ def flash(
     output = gmm_flash(activated, down_weight, tokens_per_expert)
 
     # 6. Scatter tokens back to their original positions, applying the
-    #    routing weights as part of the unpermute.
+    #    routing weights as part of the unpermute. The ``output.to(...)`` /
+    #    ``routing_weights`` pair runs the weighted-sum in routing_weights'
+    #    dtype (typically fp32, since DSV4-style routers compute scores in
+    #    fp32 for numerical stability) — equivalent to HF eager's
+    #    ``F.linear(...) * top_k_weights`` mixed-dtype multiply. The
+    #    ``.to(hidden_states.dtype)`` at the end mirrors HF eager's
+    #    ``current.to(final.dtype)`` before index_add: it casts the final
+    #    sum back to the residual stream dtype so callers see input-dtype
+    #    in, input-dtype out (the contract every other experts impl in
+    #    transformers/integrations/moe.py also satisfies). Without this
+    #    cast, fp32 routing weights silently promote the entire residual
+    #    stream layer-by-layer, eventually surfacing as
+    #    aclnnGroupedMatmul x.dtype != weight.dtype crashes downstream.
     final_hidden_states = torch_npu.npu_moe_token_unpermute(
         output.to(routing_weights.dtype),
         row_ids_map,
         probs=routing_weights,
     )
-    return final_hidden_states
+    return final_hidden_states.to(hidden_states.dtype)
 
 
 __all__ = ["flash", "_expert_weight_in_out"]
