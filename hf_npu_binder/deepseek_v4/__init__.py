@@ -2,23 +2,30 @@
 
 Mirrors HF's source layout. Each operator gets its own file; backend
 implementations are top-level functions named after the backend
-(``triton``, ``flash``, ...). Real kernels land in ``kernels/`` once
-ported.
+(``triton``, ``ascendc``, ``flash``, ...). Vendored triton kernels live
+under ``kernels/``.
 
-Current state — scaffold only:
+Modules:
 
-  * ``sparse_flash_attention.triton`` defined but raises
-    ``NotImplementedError``; the kernel port from
-    ``MindSpeed-LLM/.../g2_attention_kernel.py`` is pending. The alloy
-    bridge therefore does **not** register this entry, so callers
-    requesting ``"triton"`` quietly fall back to alloy's own torch impl
-    via the ``IMPL_REGISTRY`` ``fallback="torch"`` chain.
+  * ``sparse_flash_attention`` — CSA attention (Lightning-Indexer
+    sliding + per-query topk over compressed KV). Two backends:
+    ``triton`` (vendored MindSpeed SFA + BHSD adapter + combined-topk
+    construction) and ``ascendc`` (CANN ``aclnnSparseAttnSharedkv``
+    fused op; needs CANN 9.0.0 RC+).
 
-When the triton kernel is ported, the bridge picks it up automatically
-(see ``hf_npu_binder.DEFAULTS`` for the recommended-impl table).
+  * ``compressed_attention`` — HCA + sliding-only layers. Shares the
+    same SFA kernel as CSA; differs only in topk construction (no
+    Lightning Indexer; HCA attends to compressed range in full,
+    sliding has no compressed range at all). ``triton`` backend only
+    so far — ascendc port (HCA via ``aclnnSparseAttnSharedkv`` without
+    indexer picks) is a future extension.
+
+See ``hf_npu_binder.DEFAULTS`` for the recommended-impl table per
+intent (``auto`` / ``flash`` / ``triton`` / ``ascendc`` / ``torch``).
 """
 from __future__ import annotations
 
+from . import compressed_attention
 from . import sparse_flash_attention
 
-__all__ = ["sparse_flash_attention"]
+__all__ = ["sparse_flash_attention", "compressed_attention"]

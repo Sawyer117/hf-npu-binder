@@ -66,10 +66,11 @@ DEFAULTS: dict[str, dict[str, str]] = {
         # names hard); the alloy-convention name doesn't translate here.
         "triton": "eager",
     },
-    # ``deepseek_v4.sparse_flash_attention``: triton BHSD adapter wired
-    # (vendored MindSpeed kernel + combined-topk trick). ascendc adapter
-    # is also vendored but needs a CANN release that ships
-    # ``aclnnSparseAttnSharedkv`` in ``libopapi.so`` (9.0.0 release;
+    # ``deepseek_v4.sparse_flash_attention``: CSA layers (sliding window +
+    # Lightning-Indexer picks over compressed KV). triton BHSD adapter
+    # wired (vendored MindSpeed kernel + combined-topk trick). ascendc
+    # adapter is also vendored but needs a CANN release that ships
+    # ``aclnnSparseAttnSharedkv`` in ``libopapi.so`` (9.0.0 RC+;
     # 9.0.0-beta.1 is too old). ``auto`` -> triton until verified-fast
     # CANN is the common case; ``ascendc`` stays as an explicit opt-in.
     "deepseek_v4.sparse_flash_attention": {
@@ -79,8 +80,21 @@ DEFAULTS: dict[str, dict[str, str]] = {
         "ascendc": "ascendc",  # opt-in; needs CANN with the aclnn op
         "torch":   "torch",
     },
+    # ``deepseek_v4.compressed_attention``: HCA + sliding-only layers.
+    # Shares the SFA kernel with CSA; no Lightning Indexer. triton is
+    # the only NPU backend so far — HCA-via-aclnnSparseAttnSharedkv
+    # (without sparse indices) is a future port, so ``ascendc`` falls
+    # back to ``torch`` for now to keep ``activate(model, "ascendc")``
+    # resolving to a working impl for every layer type.
+    "deepseek_v4.compressed_attention": {
+        "auto":    "triton",
+        "flash":   "triton",
+        "triton":  "triton",
+        "ascendc": "torch",  # see above; no ascendc port yet
+        "torch":   "torch",
+    },
 }
 
 
 __all__ = ["DEFAULTS", "deepseek_v4", "qwen3_5_moe", "shared"]
-__version__ = "0.0.2"
+__version__ = "0.0.3"

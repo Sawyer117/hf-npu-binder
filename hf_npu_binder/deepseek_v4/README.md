@@ -20,29 +20,51 @@ see the Megatron layout.
 The MindSpeed-LLM training stack uses different names than HF transformers
 and alloy for the same algorithms. This table is the cross-reference:
 
-| binder operator                  | MindSpeed-LLM source                             | HF / alloy module                                   | status      |
-| -------------------------------- | ------------------------------------------------ | --------------------------------------------------- | ----------- |
-| `sparse_flash_attention.triton`  | `g2_attention_kernel.SparseFlashAttentionTriton` | `dsv4_csa.attention` torch impl in alloy CSA layers | 🟡 scaffold |
-| `compressed_attention.triton`    | `g2_attention_kernel.G2CoreAttention` torch path | `_eager_attention_with_sinks` in HCA/sliding layers | 🟡 planned  |
-| `lightning_indexer.flash`        | `mindspeed.ops.npu_sparse_lightning_indexer_*`   | `DeepseekV4Indexer.forward`                         | 🟡 planned  |
-| `compressor.triton`              | `compressor.Compressor`                          | `DeepseekV4{HCA,CSA}Compressor`                     | 🟡 planned  |
-| `rmsnorm_no_weight.triton`       | `rmsnorm_without_weight_triton_kernel`           | `DeepseekV4UnweightedRMSNorm` (q_b_norm)            | 🟢 future   |
-| `layernorm_gated.triton`         | `ops/triton/layernorm_gated`                     | gated RMSNorm in attention output                   | 🟢 future   |
-| `mhc.triton`, `sinkhorn.triton`  | `mhc/mhc_triton`, `mhc/sinkhorn_triton_kernel`   | `use_mhc=True` HyperConnection (alloy spec pending) | 🟢 future   |
+| binder operator                  | MindSpeed-LLM source                             | HF / alloy module                                            | status      |
+| -------------------------------- | ------------------------------------------------ | ------------------------------------------------------------ | ----------- |
+| `sparse_flash_attention.triton`  | `g2_attention_kernel.SparseFlashAttentionTriton` + Lightning-Indexer offset trick | `dsv4_csa.attention` in alloy CSA layers | ✅ shipped  |
+| `sparse_flash_attention.ascendc` | `mindspeed.ops.npu_sparse_attn_shared_kv` (`aclnnSparseAttnSharedkv`) | same key on `dsv4_csa.attention`, fused single kernel | 🟡 opt-in (CANN ≥ 9.0.0 RC) |
+| `compressed_attention.triton`    | same `SparseFlashAttentionTriton` kernel; topk built from sliding + all-compressed-positions (no indexer) | `dsv4_hca.attention` + `dsv4_sliding.attention` in alloy | ✅ shipped  |
+| `lightning_indexer.flash`        | `mindspeed.ops.npu_sparse_lightning_indexer_*`   | `DeepseekV4Indexer.forward`                                  | 🟡 planned  |
+| `compressor.triton`              | `compressor.Compressor`                          | `DeepseekV4{HCA,CSA}Compressor`                              | 🟡 planned  |
+| `rmsnorm_no_weight.triton`       | `rmsnorm_without_weight_triton_kernel`           | `DeepseekV4UnweightedRMSNorm` (q_b_norm)                     | 🟢 future   |
+| `layernorm_gated.triton`         | `ops/triton/layernorm_gated`                     | gated RMSNorm in attention output                            | 🟢 future   |
+| `mhc.triton`, `sinkhorn.triton`  | `mhc/mhc_triton`, `mhc/sinkhorn_triton_kernel`   | `use_mhc=True` HyperConnection (alloy spec pending)          | 🟢 future   |
 
 ### Per-architecture notes
 
-* **CSA layers** (`compress_ratio=4`, alloy `dsv4_csa_attention`): SDPA gets
-  `topk_idxs` from the Lightning Indexer; the SFA kernel only does Q · K^T on
-  the gated subset.
-* **HCA layers** (`compress_ratio=128`, alloy `dsv4_hca_attention`): SDPA
-  attends to sliding cache + heavily-compressed entries without indexer
-  gating; uses the simpler core-attention kernel.
+* **CSA layers** (`compress_ratio=4`, alloy `dsv4_csa_attention`): the SFA
+  kernel attends over sliding-window indices ++ Lightning-Indexer picks.
+  Backends: `sparse_flash_attention.triton` (auto), `.ascendc` (opt-in).
+* **HCA layers** (`compress_ratio=128`, alloy `dsv4_hca_attention`): same
+  kernel; topk is sliding-window indices ++ per-query *causal-compress*
+  indices `[0, (p+1) // compress_rate_hca)` padded with `-1` sentinels to
+  width `compressed_seq_len` — matches alloy's HCA `block_bias` over the
+  compressed columns (and HF main `ac372e10f2`). Adapter takes
+  `position_ids` via kwargs and reads `compress_rate` from
+  `module.compressor`. Backend: `compressed_attention.triton`.
 * **Sliding-only layers** (`compress_ratio=0`, alloy `dsv4_sliding_attention`):
-  same core-attention kernel as HCA but without any compressed-KV
-  concatenation; covered by the planned `compressed_attention` entry point.
+  same kernel; topk is just the sliding window, no compressed range.
+  Backend: `compressed_attention.triton`.
 * **MoE**, **embedding / lm_head / norms**: not yet wired here; precision /
   perf wins are smaller and the torch path is adequate.
+
+## CONFIG_MAP width constraint
+
+The vendored SFA kernel autotunes against a fixed set of total topk widths
+in `kernels/sparse_flash_attention_triton.py::CONFIG_MAP` —  `{128, 160, 640}`.
+The adapter sums `sliding_window` with whatever compressed-range topk it
+constructs and checks the result against this set; if it misses, you get a
+clear `ValueError` pointing at the alloy config knobs to tweak.
+
+Typical combinations that land:
+
+  * Sliding-only with `sliding_window=128` → 128 ✓
+  * CSA with `sliding_window=128 + index_topk=32` → 160 ✓
+  * HCA at 4K with `sliding_window=128 + compressed=32` (4096/128) → 160 ✓
+  * HCA at 64K with `sliding_window=128 + compressed=512` → 640 ✓
+  * HCA at 8K..32K → misses (add a TilingBlockConfig entry to CONFIG_MAP or
+    pad `sliding_window` so the sum hits a supported width).
 
 ## Wiring
 
@@ -54,19 +76,17 @@ import alloy.integrations.hf_npu_binder as bridge   # auto-registers
 bridge.activate(model, prefer="auto")               # binder picks best per operator
 ```
 
-For DSV4 CSA specifically, `bridge.activate(..., "auto")` currently sets
-`config._dsv4_csa_implementation = "torch"` because the triton kernel
-port from MindSpeed-LLM is still pending. Once
-`sparse_flash_attention.triton` is implemented, bumping the entry in
-`hf_npu_binder.DEFAULTS` from `{"auto": "torch", ...}` to
-`{"auto": "triton", ...}` is the only change needed to flip every alloy
-CSA layer to the NPU kernel — no alloy code edits required (that's the
+`activate(..., "auto")` writes `_dsv4_{csa,hca,sliding}_implementation = "triton"`
+on `model.config` (per `hf_npu_binder.DEFAULTS`), so every DSV4 attention
+layer flips to the binder fast path without touching alloy code (that's the
 point of the indirection).
 
 Per-module manual override always works:
 
 ```python
-config._dsv4_csa_implementation = "torch"   # or "triton" once the kernel ships
+config._dsv4_csa_implementation     = "ascendc"  # opt-in fused kernel
+config._dsv4_hca_implementation     = "torch"    # bypass triton for one type
+config._dsv4_sliding_implementation = "torch"
 ```
 
 `hf_npu_binder.shared` carries cross-family primitives (e.g. `gmm`); inspect
