@@ -132,4 +132,4 @@ DEFAULTS: dict[str, dict[str, str]] = {
 
 
 __all__ = ["DEFAULTS", "deepseek_v4", "qwen3_5_moe", "shared"]
-__version__ = "0.0.5"
+__version__ = "0.1.0"
