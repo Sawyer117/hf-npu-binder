@@ -114,8 +114,22 @@ DEFAULTS: dict[str, dict[str, str]] = {
         "ascendc": "torch",  # see above; no ascendc port yet
         "torch":   "torch",
     },
+    # ``deepseek_v4.hyper_connection``: DSV4 MHC residual-stream mixer.
+    # Composes 3 vendored MindSpeed triton kernels (rmsnorm-rsqrt,
+    # sinkhorn, pre_bmm). Hardcoded hc_mult=4 (DSV4 paper config) —
+    # callers with other hc_mult must stay on torch. ``auto`` is left
+    # at ``torch`` for the same evidence-based reason as the other DSV4
+    # surfaces: no production-scale measurement yet, so opt-in only.
+    "deepseek_v4.hyper_connection": {
+        "auto":    "torch",
+        "flash":   "triton",  # alias; triton is the only non-torch path so far
+        "triton":  "triton",
+        "ascendc": "torch",  # no ascendc port (would need an aclnn op for the
+                             # full sinkhorn + bmm chain; not currently a CANN op)
+        "torch":   "torch",
+    },
 }
 
 
 __all__ = ["DEFAULTS", "deepseek_v4", "qwen3_5_moe", "shared"]
-__version__ = "0.0.4"
+__version__ = "0.0.5"

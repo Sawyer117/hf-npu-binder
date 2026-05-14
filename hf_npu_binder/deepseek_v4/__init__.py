@@ -20,12 +20,20 @@ Modules:
     so far — ascendc port (HCA via ``aclnnSparseAttnSharedkv`` without
     indexer picks) is a future extension.
 
+  * ``hyper_connection`` — MHC (Mixture of Head Clusters /
+    HyperConnection) for DSV4's residual stream mixing. ``triton``
+    backend composes 3 vendored MindSpeed kernels:
+    ``mhc/rmsnorm_without_weight``, ``mhc/sinkhorn``,
+    ``mhc/pre_bmm``. **Hardcoded hc_mult=4** (DSV4 paper config);
+    raises clear ValueError otherwise.
+
 See ``hf_npu_binder.DEFAULTS`` for the recommended-impl table per
 intent (``auto`` / ``flash`` / ``triton`` / ``ascendc`` / ``torch``).
 """
 from __future__ import annotations
 
 from . import compressed_attention
+from . import hyper_connection
 from . import sparse_flash_attention
 
-__all__ = ["sparse_flash_attention", "compressed_attention"]
+__all__ = ["sparse_flash_attention", "compressed_attention", "hyper_connection"]
