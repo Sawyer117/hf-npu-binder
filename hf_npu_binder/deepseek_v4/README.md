@@ -76,10 +76,26 @@ import alloy.integrations.hf_npu_binder as bridge   # auto-registers
 bridge.activate(model, prefer="auto")               # binder picks best per operator
 ```
 
-`activate(..., "auto")` writes `_dsv4_{csa,hca,sliding}_implementation = "triton"`
-on `model.config` (per `hf_npu_binder.DEFAULTS`), so every DSV4 attention
-layer flips to the binder fast path without touching alloy code (that's the
-point of the indirection).
+As of binder 0.0.4, `activate(..., "auto")` writes
+`_dsv4_{csa,hca,sliding}_implementation = "torch"` on `model.config` (per
+`hf_npu_binder.DEFAULTS`). Rationale: at the configs measured so far,
+triton-ascend is not a speed win over torch_npu eager (which itself
+auto-dispatches to NPU's hardware-fused attention primitives) and the
+triton wrapper introduces measurable bf16 drift through stacked layers
+— so making it the silent default would degrade both axes. Explicit
+opt-in is still cheap:
+
+```python
+bridge.activate(model, prefer="triton")              # all DSV4 attn -> triton
+bridge.activate(model, prefer={"dsv4_csa": "triton"}) # just CSA -> triton
+bridge.activate(model, prefer="ascendc")             # CSA -> ascendc (genuine prod fast path,
+                                                     # requires CANN 9.0.0 RC+ ship of
+                                                     # aclnnSparseAttnSharedkv)
+```
+
+Will revisit `auto` once production-scale benchmarks (long seq + larger
+batch + many layers) show triton beating eager — toy 4-layer config is
+the worst case for triton due to launch overhead dominating compute.
 
 Per-module manual override always works:
 
